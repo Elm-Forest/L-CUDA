@@ -23,53 +23,41 @@ __device__ __forceinline__ T from_float(float val) { return (T)val; }
 template<>
 __device__ __forceinline__ half from_float<half>(float val) { return __float2half(val); }
 
-// 【新增】手动实现 double 类型的 atomicAdd
-// 利用 atomicCAS 实现，兼容所有 CUDA 架构（解决编译报错）
-__device__ __forceinline__ double atomicAdd_double(double* address, double val) {
-    unsigned long long int* address_as_ull = (unsigned long long int*)address;
-    unsigned long long int old = *address_as_ull, assumed;
-    do {
-        assumed = old;
-        // 将 double 转换位模式为 unsigned long long 进行 CAS 操作
-        old = atomicCAS(address_as_ull, assumed,
-                        __double_as_longlong(__longlong_as_double(assumed) + val));
-    } while (assumed != old);
-    return __longlong_as_double(old);
-}
-
 // --------------------------------------------------------------------------
-// 1. Trace Implementation (Multi-Block + Double Precision for A100)
+// 1. Trace Implementation (Safe Single-Block Version)
 // --------------------------------------------------------------------------
+// 回归单 Block 实现，彻底避免多 Block 原子竞争导致的死锁/活锁风险
+// 同时内部使用 double 累加，保证 Test #17 精度通过
 
 template <typename T>
-__global__ void trace_kernel_multi_block(const T* input, double* output, size_t cols, size_t n) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = blockDim.x * gridDim.x;
+__global__ void trace_kernel_single_block(const T* input, T* output, size_t cols, size_t n) {
+    size_t tid = threadIdx.x;
+    size_t stride = blockDim.x;
 
+    // 内部使用 double 累加保证精度
     double local_sum = 0.0;
     
-    // Grid-Stride Loop
+    // Grid-Stride Loop (Limited to single block)
     for (size_t i = tid; i < n; i += stride) {
         local_sum += (double)input[i * cols + i];
     }
 
-    // Block 内归约 (Shared Memory)
+    // Block 内归约
     __shared__ double s_data[256];
-    s_data[threadIdx.x] = local_sum;
+    s_data[tid] = local_sum;
     __syncthreads();
 
     // 树状归约
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            s_data[threadIdx.x] += s_data[threadIdx.x + s];
+        if (tid < s) {
+            s_data[tid] += s_data[tid + s];
         }
         __syncthreads();
     }
 
-    // 每个 Block 的结果原子累加到全局 double 缓存
-    if (threadIdx.x == 0) {
-        // 【修正】使用自定义的 atomicAdd_double 替代 atomicAdd
-        atomicAdd_double(output, s_data[0]);
+    // 单线程写回，无需原子操作，绝对安全
+    if (tid == 0) {
+        *output = (T)s_data[0];
     }
 }
 
@@ -79,34 +67,32 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
     if (n == 0) return T(0);
 
     T* d_input = nullptr;
-    double* d_temp_result = nullptr; 
-    
+    T* d_result = nullptr;
+    T h_result = 0;
+
     cudaMalloc(&d_input, h_input.size() * sizeof(T));
-    cudaMalloc(&d_temp_result, sizeof(double));
+    cudaMalloc(&d_result, sizeof(T));
     
     cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(T), cudaMemcpyHostToDevice);
-    cudaMemset(d_temp_result, 0, sizeof(double)); 
 
-    // A100: 256 Blocks * 256 Threads
-    int blockSize = 256;
-    int numBlocks = std::min((size_t)256, (n + blockSize - 1) / blockSize);
-    
-    trace_kernel_multi_block<<<numBlocks, blockSize>>>(d_input, d_temp_result, cols, n);
+    // 仅启动 1 个 Block，256 个线程
+    trace_kernel_single_block<<<1, 256>>>(d_input, d_result, cols, n);
 
-    double h_temp_result = 0.0;
-    cudaMemcpy(&h_temp_result, d_temp_result, sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_result, d_result, sizeof(T), cudaMemcpyDeviceToHost);
 
     cudaFree(d_input);
-    cudaFree(d_temp_result);
+    cudaFree(d_result);
 
-    return (T)h_temp_result;
+    return h_result;
 }
 
 // --------------------------------------------------------------------------
-// 2. Flash Attention Implementation (Hybrid Parallel Two-Pass Optimized)
+// 2. Flash Attention Implementation (Safe Hybrid Parallel)
 // --------------------------------------------------------------------------
 
-#define CHUNK_SIZE 64
+// 将 CHUNK_SIZE 设为 32，对应 1 个 Warp
+// Shared Memory 占用约 33KB，在所有高端/中端卡上都绝对安全
+#define CHUNK_SIZE 32
 
 template <typename T>
 __global__ void flash_attn_hybrid_kernel(
@@ -127,13 +113,19 @@ __global__ void flash_attn_hybrid_kernel(
     long long kv_base_offset = ((long long)b * src_seq_len * kv_heads + kv_h) * head_dim;
     long long kv_stride = kv_heads * head_dim;
 
+    // Shared Memory Layout
+    // s_Q: head_dim
+    // s_K: CHUNK * head_dim
+    // s_Scores: CHUNK
     extern __shared__ float s_mem[];
     float* s_Q = s_mem;                        
     float* s_K = s_Q + head_dim;               
     float* s_Scores = s_K + CHUNK_SIZE * head_dim; 
+    // Pass 2 Reuse
     float* s_V = s_K + CHUNK_SIZE * head_dim; 
     float* s_Scores_Safe = s_V + CHUNK_SIZE * head_dim;
 
+    // Load Q
     if (tid < head_dim) {
         s_Q[tid] = to_float(Q[q_idx_base + tid]);
     }
@@ -149,6 +141,7 @@ __global__ void flash_attn_hybrid_kernel(
     for (int k_base = 0; k_base < src_seq_len; k_base += CHUNK_SIZE) {
         int items = min(CHUNK_SIZE, src_seq_len - k_base);
 
+        // Load K Chunk
         int num_elements = CHUNK_SIZE * head_dim;
         for (int i = tid; i < num_elements; i += blockDim.x) {
             int r = i / head_dim;
@@ -159,13 +152,14 @@ __global__ void flash_attn_hybrid_kernel(
         }
         __syncthreads();
 
+        // Compute Scores (Hybrid Parallel + Serial Inner Loop)
         if (tid < items) {
             int k_curr = k_base + tid;
             if (is_causal && k_curr > q_row) {
                 s_Scores_Safe[tid] = -1e38f; 
             } else {
                 float dot = 0.0f;
-                #pragma unroll
+                // #pragma unroll // 暂时移除 unroll 以防编译器优化过度导致寄存器溢出
                 for (int d = 0; d < head_dim; ++d) {
                     dot += s_Q[d] * s_K[tid * head_dim + d];
                 }
@@ -174,8 +168,8 @@ __global__ void flash_attn_hybrid_kernel(
         }
         __syncthreads();
 
+        // Update Stats (Serial)
         if (tid == 0) {
-            #pragma unroll
             for (int j = 0; j < items; ++j) {
                 float val = s_Scores_Safe[j];
                 if (val > -1e37f) {
@@ -212,6 +206,7 @@ __global__ void flash_attn_hybrid_kernel(
     for (int k_base = 0; k_base < src_seq_len; k_base += CHUNK_SIZE) {
         int items = min(CHUNK_SIZE, src_seq_len - k_base);
 
+        // Load K and V
         int num_elements = CHUNK_SIZE * head_dim;
         for (int i = tid; i < num_elements; i += blockDim.x) {
             int r = i / head_dim;
@@ -224,13 +219,13 @@ __global__ void flash_attn_hybrid_kernel(
         }
         __syncthreads();
 
+        // Re-Compute Scores
         if (tid < items) {
             int k_curr = k_base + tid;
             if (is_causal && k_curr > q_row) {
                 s_Scores_Safe[tid] = -1e38f; 
             } else {
                 float dot = 0.0f;
-                #pragma unroll
                 for (int d = 0; d < head_dim; ++d) {
                     dot += s_Q[d] * s_K[tid * head_dim + d];
                 }
@@ -239,8 +234,8 @@ __global__ void flash_attn_hybrid_kernel(
         }
         __syncthreads();
 
+        // Accumulate Output
         if (tid < head_dim) {
-            #pragma unroll
             for (int j = 0; j < items; ++j) {
                 float val = s_Scores_Safe[j];
                 if (val > -1e37f) {
@@ -286,6 +281,8 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
     dim3 grid(target_seq_len, query_heads, batch_size);
     
+    // Block Size 设为 128 (对应 CHUNK_SIZE 32 和 head_dim <= 128)
+    // 这是一个非常“安全”的配置，兼容性极好
     int blockSize = 128;
     while (blockSize < head_dim) blockSize += 32;
     if (blockSize < CHUNK_SIZE) blockSize = CHUNK_SIZE;
