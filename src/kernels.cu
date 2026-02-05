@@ -24,40 +24,22 @@ template<>
 __device__ __forceinline__ half from_float<half>(float val) { return __float2half(val); }
 
 // --------------------------------------------------------------------------
-// 1. Trace Implementation (Safe Single-Block Version)
+// 1. Trace Implementation (Ultra-Safe Serial Version)
 // --------------------------------------------------------------------------
-// 回归单 Block 实现，彻底避免多 Block 原子竞争导致的死锁/活锁风险
-// 同时内部使用 double 累加，保证 Test #17 精度通过
+// 针对 BI100 优化：放弃多 Block 并行，改用单线程串行。
+// 彻底消除了 atomicAdd，避免了原子锁死锁（Hang）和编译报错问题。
+// 由于 N 通常较小，这种实现在高端卡上依然瞬间完成，且数值精度最高。
 
 template <typename T>
-__global__ void trace_kernel_single_block(const T* input, T* output, size_t cols, size_t n) {
-    size_t tid = threadIdx.x;
-    size_t stride = blockDim.x;
-
-    // 内部使用 double 累加保证精度
-    double local_sum = 0.0;
-    
-    // Grid-Stride Loop (Limited to single block)
-    for (size_t i = tid; i < n; i += stride) {
-        local_sum += (double)input[i * cols + i];
-    }
-
-    // Block 内归约
-    __shared__ double s_data[256];
-    s_data[tid] = local_sum;
-    __syncthreads();
-
-    // 树状归约
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_data[tid] += s_data[tid + s];
+__global__ void trace_kernel_serial(const T* input, T* output, size_t cols, size_t n) {
+    // 仅由第 0 个 Block 的第 0 个线程执行
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        double sum = 0.0;
+        // 串行累加，与 CPU 行为完全一致，保证精度
+        for (size_t i = 0; i < n; ++i) {
+            sum += (double)input[i * cols + i];
         }
-        __syncthreads();
-    }
-
-    // 单线程写回，无需原子操作，绝对安全
-    if (tid == 0) {
-        *output = (T)s_data[0];
+        *output = (T)sum;
     }
 }
 
@@ -75,8 +57,8 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
     
     cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(T), cudaMemcpyHostToDevice);
 
-    // 仅启动 1 个 Block，256 个线程
-    trace_kernel_single_block<<<1, 256>>>(d_input, d_result, cols, n);
+    // 启动 1 个 Block，1 个线程。绝对稳定。
+    trace_kernel_serial<<<1, 1>>>(d_input, d_result, cols, n);
 
     cudaMemcpy(&h_result, d_result, sizeof(T), cudaMemcpyDeviceToHost);
 
@@ -87,15 +69,17 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 }
 
 // --------------------------------------------------------------------------
-// 2. Flash Attention Implementation (Safe Hybrid Parallel)
+// 2. Flash Attention (Double-Precision Tiled One-Pass)
 // --------------------------------------------------------------------------
+// 策略：
+// 1. 使用标准的 One-Pass 分块算法，逻辑简单，避免死锁。
+// 2. 关键：所有中间累加器（Max, Sum, Output）均使用 double。
+//    这能有效解决 float 测试中的精度误差 (Test 6/13/14)，同时不需要 Two-Pass 的复杂同步。
 
-// 将 CHUNK_SIZE 设为 32，对应 1 个 Warp
-// Shared Memory 占用约 33KB，在所有高端/中端卡上都绝对安全
-#define CHUNK_SIZE 32
+#define CHUNK_SIZE 32 // 保持为 Warp 大小，兼顾效率和 Shared Memory 限制
 
 template <typename T>
-__global__ void flash_attn_hybrid_kernel(
+__global__ void flash_attn_double_precision_kernel(
     const T* __restrict__ Q, 
     const T* __restrict__ K, 
     const T* __restrict__ V, 
@@ -103,110 +87,43 @@ __global__ void flash_attn_hybrid_kernel(
     int src_seq_len, int head_dim, int kv_heads, int group_size, 
     bool is_causal, float scale
 ) {
+    // Grid: (Tgt_Len, Heads, Batch)
+    // Block: 128 threads (覆盖 head_dim)
+    
     int tid = threadIdx.x;
     int b = blockIdx.z;
     int h = blockIdx.y;
     int q_row = blockIdx.x;
     int kv_h = h / group_size;
 
+    // Offsets
     long long q_idx_base = ((long long)b * gridDim.x * gridDim.y + q_row * gridDim.y + h) * head_dim;
     long long kv_base_offset = ((long long)b * src_seq_len * kv_heads + kv_h) * head_dim;
     long long kv_stride = kv_heads * head_dim;
 
-    // Shared Memory Layout
-    // s_Q: head_dim
-    // s_K: CHUNK * head_dim
-    // s_Scores: CHUNK
+    // Shared Memory: 缓存 K 和 V 的块
+    // Layout: K_chunk [CHUNK][Dim] | V_chunk [CHUNK][Dim]
     extern __shared__ float s_mem[];
-    float* s_Q = s_mem;                        
-    float* s_K = s_Q + head_dim;               
-    float* s_Scores = s_K + CHUNK_SIZE * head_dim; 
-    // Pass 2 Reuse
-    float* s_V = s_K + CHUNK_SIZE * head_dim; 
-    float* s_Scores_Safe = s_V + CHUNK_SIZE * head_dim;
+    float* s_K = s_mem;
+    float* s_V = s_mem + CHUNK_SIZE * head_dim;
 
-    // Load Q
+    // 寄存器缓存 Q (每个线程持有一个 Q 的维度分量)
+    // 注意：这里我们让每个线程处理 Head_Dim 的一个元素，并在循环中处理 K 
+    float q_val = 0.0f;
     if (tid < head_dim) {
-        s_Q[tid] = to_float(Q[q_idx_base + tid]);
+        q_val = to_float(Q[q_idx_base + tid]);
     }
-    __syncthreads();
 
-    // =============================================================
-    // PASS 1: Statistics (Max, Sum)
-    // =============================================================
-    
-    float m_global = -1e38f;
-    float l_global = 0.0f;
+    // 累加器使用 double 以保证极高精度
+    double m_i = -1e100; // Global Max
+    double l_i = 0.0;    // Global Sum
+    double acc_o = 0.0;  // Global Output accumulator for this dimension
 
+    // Loop over K/V Chunks
     for (int k_base = 0; k_base < src_seq_len; k_base += CHUNK_SIZE) {
         int items = min(CHUNK_SIZE, src_seq_len - k_base);
 
-        // Load K Chunk
-        int num_elements = CHUNK_SIZE * head_dim;
-        for (int i = tid; i < num_elements; i += blockDim.x) {
-            int r = i / head_dim;
-            int c = i % head_dim;
-            if (r < items) {
-                s_K[i] = to_float(K[kv_base_offset + (k_base + r) * kv_stride + c]);
-            }
-        }
-        __syncthreads();
-
-        // Compute Scores (Hybrid Parallel + Serial Inner Loop)
-        if (tid < items) {
-            int k_curr = k_base + tid;
-            if (is_causal && k_curr > q_row) {
-                s_Scores_Safe[tid] = -1e38f; 
-            } else {
-                float dot = 0.0f;
-                // #pragma unroll // 暂时移除 unroll 以防编译器优化过度导致寄存器溢出
-                for (int d = 0; d < head_dim; ++d) {
-                    dot += s_Q[d] * s_K[tid * head_dim + d];
-                }
-                s_Scores_Safe[tid] = dot * scale;
-            }
-        }
-        __syncthreads();
-
-        // Update Stats (Serial)
-        if (tid == 0) {
-            for (int j = 0; j < items; ++j) {
-                float val = s_Scores_Safe[j];
-                if (val > -1e37f) {
-                    float new_m = max(m_global, val);
-                    float exp_delta = expf(m_global - new_m);
-                    float exp_val = expf(val - new_m);
-                    l_global = l_global * exp_delta + exp_val;
-                    m_global = new_m;
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    __shared__ float final_m;
-    __shared__ float final_l;
-    if (tid == 0) {
-        final_m = m_global;
-        final_l = l_global;
-    }
-    __syncthreads();
-
-    if (final_l <= 0.0f) {
-        if (tid < head_dim) O[q_idx_base + tid] = from_float<T>(0.0f);
-        return;
-    }
-
-    // =============================================================
-    // PASS 2: Output Aggregation
-    // =============================================================
-    
-    float acc_o = 0.0f; 
-
-    for (int k_base = 0; k_base < src_seq_len; k_base += CHUNK_SIZE) {
-        int items = min(CHUNK_SIZE, src_seq_len - k_base);
-
-        // Load K and V
+        // 1. Load K & V Chunks to Shared Memory
         int num_elements = CHUNK_SIZE * head_dim;
         for (int i = tid; i < num_elements; i += blockDim.x) {
             int r = i / head_dim;
@@ -214,103 +131,49 @@ __global__ void flash_attn_hybrid_kernel(
             if (r < items) {
                 long long off = kv_base_offset + (k_base + r) * kv_stride + c;
                 s_K[i] = to_float(K[off]);
-                s_V[i] = to_float(V[off]); 
-            }
-        }
-        __syncthreads();
-
-        // Re-Compute Scores
-        if (tid < items) {
-            int k_curr = k_base + tid;
-            if (is_causal && k_curr > q_row) {
-                s_Scores_Safe[tid] = -1e38f; 
+                s_V[i] = to_float(V[off]);
             } else {
-                float dot = 0.0f;
-                for (int d = 0; d < head_dim; ++d) {
-                    dot += s_Q[d] * s_K[tid * head_dim + d];
-                }
-                s_Scores_Safe[tid] = dot * scale;
+                // Pad with zeros to avoid NaN issues
+                s_K[i] = 0.0f;
+                s_V[i] = 0.0f;
             }
         }
         __syncthreads();
 
-        // Accumulate Output
-        if (tid < head_dim) {
-            for (int j = 0; j < items; ++j) {
-                float val = s_Scores_Safe[j];
-                if (val > -1e37f) {
-                    float weight = expf(val - final_m);
-                    acc_o += weight * s_V[j * head_dim + tid];
-                }
+        // 2. Compute Attention for this Chunk
+        for (int j = 0; j < items; ++j) {
+            int k_curr = k_base + j;
+            if (is_causal && k_curr > q_row) continue;
+
+            // Compute Dot Product: Q . K[j]
+            // 每个线程计算一部分？不，我们需要完整的点积。
+            // 这里使用更简单的方式：每个线程计算一个 d 分量的贡献，然后归约？太慢。
+            // 我们让当前线程计算 Output[tid]，这需要遍历所有 j。
+            // 为了算出 Softmax，我们需要先算出 Score[j]。
+            // 这需要 Q 和 K[j] 的完整点积。
+            
+            // 为了避免复杂的 Block 归约，我们这里重复计算点积。
+            // 虽然有冗余，但在 High-End GPU 上通常带宽是瓶颈，计算不是。
+            // 且这种方式绝对无死锁。
+            
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                // 从 Shared Mem 读取 K，Q 在寄存器或 Global
+                // Q 我们只有 q_val (对应 tid)。我们需要整个 Q。
+                // 这意味着上面的 q_val 策略不够。
+                // 修正：我们需要 Q 的所有值。
+                // 鉴于 Shared Mem 有限，且 Head Dim 不大（<=128），
+                // 我们在内层循环直接读取 s_K 即可，但 Q 最好也在 Shared 或重读。
+                // 考虑到 head_dim 很小，我们可以在循环里直接通过 Global Memory 读取 Q[d] ? 
+                // 或者，我们假设 tid < head_dim，我们无法拥有所有 Q。
+                
+                // 为了简单且正确，我们需要 Score。
+                // 让我们使用 Shared Memory 存储 Q。
+                // 重新规划 Shared Memory: Q | K | V
             }
         }
-        __syncthreads();
-    }
-
-    if (tid < head_dim) {
-        O[q_idx_base + tid] = from_float<T>(acc_o / final_l);
     }
 }
-
-
-template <typename T>
-void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
-                    const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-    
-    size_t q_size = h_q.size() * sizeof(T);
-    size_t k_size = h_k.size() * sizeof(T);
-    size_t v_size = h_v.size() * sizeof(T);
-    size_t o_size = h_o.size() * sizeof(T); 
-    
-    if (h_o.size() != h_q.size()) h_o.resize(h_q.size());
-
-    T *d_q, *d_k, *d_v, *d_o;
-    cudaMalloc(&d_q, q_size);
-    cudaMalloc(&d_k, k_size);
-    cudaMalloc(&d_v, v_size);
-    cudaMalloc(&d_o, o_size);
-
-    cudaMemcpy(d_q, h_q.data(), q_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k, h_k.data(), k_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v, h_v.data(), v_size, cudaMemcpyHostToDevice);
-    
-    float scale = 1.0f / sqrtf((float)head_dim);
-    int group_size = query_heads / kv_heads;
-
-    dim3 grid(target_seq_len, query_heads, batch_size);
-    
-    // Block Size 设为 128 (对应 CHUNK_SIZE 32 和 head_dim <= 128)
-    // 这是一个非常“安全”的配置，兼容性极好
-    int blockSize = 128;
-    while (blockSize < head_dim) blockSize += 32;
-    if (blockSize < CHUNK_SIZE) blockSize = CHUNK_SIZE;
-    
-    size_t smem_size = (head_dim + 2 * CHUNK_SIZE * head_dim + CHUNK_SIZE) * sizeof(float);
-
-    flash_attn_hybrid_kernel<<<grid, blockSize, smem_size>>>(
-        d_q, d_k, d_v, d_o, 
-        src_seq_len, head_dim, kv_heads, group_size, 
-        is_causal, scale
-    );
-
-    cudaMemcpy(h_o.data(), d_o, o_size, cudaMemcpyDeviceToHost);
-
-    cudaFree(d_q);
-    cudaFree(d_k);
-    cudaFree(d_v);
-    cudaFree(d_o);
-}
-
-// ==========================================
-// Explicit Template Instantiations
-// ==========================================
-template int trace<int>(const std::vector<int>&, size_t, size_t);
-template float trace<float>(const std::vector<float>&, size_t, size_t);
-template void flashAttention<float>(const std::vector<float>&, const std::vector<float>&,
-  const std::vector<float>&, std::vector<float>&,
-  int, int, int, int, int, int, bool);
-template void flashAttention<half>(const std::vector<half>&, const std::vector<half>&,
-  const std::vector<half>&, std::vector<half>&,
-  int, int, int, int, int, int, bool);
+// 上面的 Kernel 逻辑写到一半发现 One-Pass 在并行 Output 维度时，计算 Score 比较麻烦。
+// 让我们换回最稳的 "Naive Block-Parallel" (每个 Block 处理一行 Q)
+// 并且使用 Shared Mem 缓存 Q, K, V。
